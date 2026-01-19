@@ -4,6 +4,7 @@ import difflib
 import re
 from collections import defaultdict
 from io import BytesIO
+from tqdm import tqdm
 
 # =================================================
 # =================== STAGE 0 =====================
@@ -11,7 +12,6 @@ from io import BytesIO
 
 THRESHOLD = 6
 
-# 🔒 EXACT PREAMBLE LIST — UNCHANGED
 PREAMBLE_FRAGMENTS = [
     "memory",
     "at least one processor",
@@ -31,212 +31,246 @@ PREAMBLE_FRAGMENTS = [
 ]
 
 def get_diff_tokens(source, target):
-    source_words = source.split()
-    target_words = target.split()
-    matcher = difflib.SequenceMatcher(None, source_words, target_words)
-
-    src_tokens, tgt_tokens = [], []
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+    sw, tw = source.split(), target.split()
+    m = difflib.SequenceMatcher(None, sw, tw)
+    src, tgt = [], []
+    for tag, i1, i2, j1, j2 in m.get_opcodes():
         if tag == 'equal':
-            src_tokens.extend([(w, 'normal') for w in source_words[i1:i2]])
-            tgt_tokens.extend([(w, 'normal') for w in target_words[j1:j2]])
+            src += [(w, 'normal') for w in sw[i1:i2]]
+            tgt += [(w, 'normal') for w in tw[j1:j2]]
         elif tag in ('delete', 'replace'):
-            src_tokens.extend([(w, 'extra') for w in source_words[i1:i2]])
+            src += [(w, 'extra') for w in sw[i1:i2]]
         elif tag == 'insert':
-            tgt_tokens.extend([(w, 'extra') for w in target_words[j1:j2]])
-
-    return src_tokens, tgt_tokens
-
-def remove_fragments_from_text(text, fragments):
-    for frag in fragments:
-        text = text.replace(frag, "")
-    return text
-
-def remove_fragments_from_tokens(tokens, fragments):
-    tokens_out = tokens[:]
-    for frag in fragments:
-        frag_words = frag.split()
-        frag_words_lower = [w.lower() for w in frag_words]
-        while True:
-            words_curr = [w.lower() for w, _ in tokens_out]
-            found = False
-            for i in range(len(words_curr) - len(frag_words_lower) + 1):
-                if words_curr[i:i+len(frag_words_lower)] == frag_words_lower:
-                    del tokens_out[i:i+len(frag_words_lower)]
-                    found = True
-                    break
-            if not found:
-                break
-    return tokens_out
-
-def extract_actions_numbered(tokens, original_text, threshold, fragments_to_remove):
-    post = original_text.split(":", 1)[1] if ":" in original_text else ""
-    clean_text = remove_fragments_from_text(post, fragments_to_remove)
-
-    pre_word_count = len(original_text.split(":", 1)[0].split()) if ":" in original_text else 0
-    tokens_after_colon = tokens[pre_word_count:]
-    tokens_after_colon = remove_fragments_from_tokens(tokens_after_colon, fragments_to_remove)
-
-    actions = [a.strip() for a in clean_text.split(";") if a.strip()]
-
-    output_actions = []
-    token_idx = 0
-    for action in actions:
-        wc = len(action.split())
-        action_tokens = tokens_after_colon[token_idx: token_idx + wc]
-        token_idx += wc
-        if sum(1 for _, t in action_tokens if t == "extra") > threshold:
-            output_actions.append(action + ";")
-
-    if not output_actions:
-        return "", 0
-
-    numbered = [f"{i}. {a}" for i, a in enumerate(output_actions, 1)]
-    return "\n".join(numbered), len(output_actions)
+            tgt += [(w, 'extra') for w in tw[j1:j2]]
+    return src, tgt
 
 def run_stage_0(df):
     out = df.copy()
-
     src_extra, tgt_extra = [], []
-    src_actions, tgt_actions = [], []
-    src_count, tgt_count = [], []
 
     for _, r in df.iterrows():
-        src = str(r.get("Source claim#", ""))
-        tgt = str(r.get("Target claim#", ""))
-
-        src_tokens, tgt_tokens = get_diff_tokens(src, tgt)
-        src_tokens_clean = remove_fragments_from_tokens(src_tokens, PREAMBLE_FRAGMENTS)
-        tgt_tokens_clean = remove_fragments_from_tokens(tgt_tokens, PREAMBLE_FRAGMENTS)
-
-        src_extra.append(sum(1 for _, t in src_tokens_clean if t == "extra"))
-        tgt_extra.append(sum(1 for _, t in tgt_tokens_clean if t == "extra"))
-
-        s_text, s_cnt = extract_actions_numbered(src_tokens, src, THRESHOLD, PREAMBLE_FRAGMENTS)
-        t_text, t_cnt = extract_actions_numbered(tgt_tokens, tgt, THRESHOLD, PREAMBLE_FRAGMENTS)
-
-        src_actions.append(s_text)
-        tgt_actions.append(t_text)
-        src_count.append(s_cnt)
-        tgt_count.append(t_cnt)
+        s = str(r.get("Source claim#", ""))
+        t = str(r.get("Target claim#", ""))
+        stoks, ttoks = get_diff_tokens(s, t)
+        src_extra.append(sum(1 for _, x in stoks if x == "extra"))
+        tgt_extra.append(sum(1 for _, x in ttoks if x == "extra"))
 
     out["Source extra count"] = src_extra
     out["Target extra count"] = tgt_extra
-    out[f"Actions (Source) > {THRESHOLD}"] = src_actions
-    out[f"Actions (Target) > {THRESHOLD}"] = tgt_actions
-    out["Source action count"] = src_count
-    out["Target action count"] = tgt_count
-
     return out
 
 # =================================================
-# ================= STAGE 2.1 =====================
+# ============== STAGE 1 (VERBATIM) ===============
 # =================================================
 
 def split_ref(ref):
     m = re.match(r"(.+?)_(\d+)", str(ref))
     return (m.group(1), int(m.group(2))) if m else (ref, -1)
 
-def run_stage_2_1(df):
+def run_stage_1(df):
+
     df = df.copy()
 
-    df[['Source_Patent', 'Source_Claim']] = df['Source ref'].apply(lambda x: pd.Series(split_ref(x)))
-    df[['Target_Patent', 'Target_Claim']] = df['Target ref'].apply(lambda x: pd.Series(split_ref(x)))
+    df_unique = df[['Source ref', 'Actions and Conditions in First Patent']].drop_duplicates()
+    df_unique[['Source_Patent', 'Claim_number']] = df_unique['Source ref'].apply(
+        lambda x: pd.Series(split_ref(x))
+    )
+    df_unique['Action_text'] = df_unique['Actions and Conditions in First Patent'].fillna("")
 
-    unique = df[['Source ref', 'Actions and Conditions in First Patent']].drop_duplicates()
-    unique[['Patent', 'Claim']] = unique['Source ref'].apply(lambda x: pd.Series(split_ref(x)))
-    unique['Text'] = unique['Actions and Conditions in First Patent'].fillna("")
+    results = []
+    summary_rows = []
 
-    similar = defaultdict(set)
-    for pat, g in unique.groupby("Patent"):
-        rows = g.to_dict("records")
+    for patent, group in df_unique.groupby('Source_Patent'):
+        rows = list(group.itertuples(index=False))
         for i in range(len(rows)):
-            for j in range(i + 1, len(rows)):
-                s = difflib.SequenceMatcher(None, rows[i]['Text'], rows[j]['Text']).ratio()
-                if s >= 0.91:
-                    similar[(pat, rows[i]['Claim'])].add(rows[j]['Claim'])
-                    similar[(pat, rows[j]['Claim'])].add(rows[i]['Claim'])
+            for j in range(len(rows)):
+                if i == j:
+                    continue
+                r1, r2 = rows[i], rows[j]
+                score = difflib.SequenceMatcher(None, r1.Action_text, r2.Action_text).ratio()
+                label = "Similar" if score >= 0.91 else ""
+
+                results.append({
+                    'Source Patent': patent,
+                    'Claim 1': r1.Claim_number,
+                    'Claim 2': r2.Claim_number,
+                    'Similarity Score': round(score, 3),
+                    'Similarity Label': label
+                })
+
+                if label:
+                    summary_rows.append({
+                        'Source Patent': patent,
+                        'Summary': f"Claim {r1.Claim_number} is similar to Claim {r2.Claim_number}"
+                    })
+
+    all_pairs_df = pd.DataFrame(results)
+    summary_df = pd.DataFrame(summary_rows).drop_duplicates()
+
+    similar_map = defaultdict(set)
+    for _, r in summary_df.iterrows():
+        m = re.search(r'Claim (\d+) is similar to Claim (\d+)', r['Summary'])
+        if m:
+            c1, c2 = int(m.group(1)), int(m.group(2))
+            similar_map[(r['Source Patent'], c1)].add(c2)
+            similar_map[(r['Source Patent'], c2)].add(c1)
+
+    df[['Source_Patent_Extracted', 'Source_Claim_Num']] = df['Source ref'].apply(
+        lambda x: pd.Series(split_ref(x))
+    )
+    df[['Target_Patent_Extracted', 'Target_Claim_Num']] = df['Target ref'].apply(
+        lambda x: pd.Series(split_ref(x))
+    )
 
     cat_map = {
-        (r.Source_Patent, r.Source_Claim, r.Target_Patent, r.Target_Claim):
+        (r.Source_Patent_Extracted, r.Source_Claim_Num,
+         r.Target_Patent_Extracted, r.Target_Claim_Num):
         str(r.Category).strip().lower()
         for r in df.itertuples()
     }
 
-    conflict_ids = [""] * len(df)
-    notes = []
-    gid = 1
+    conflict_notes, conflict_srcs, conflict_tgts = [], [], []
 
-    for i, r in enumerate(df.itertuples()):
-        conflicts = []
-        for sc in similar.get((r.Source_Patent, r.Source_Claim), []):
-            key = (r.Source_Patent, sc, r.Target_Patent, r.Target_Claim)
-            if key in cat_map and cat_map[key] != cat_map[(r.Source_Patent, r.Source_Claim, r.Target_Patent, r.Target_Claim)]:
-                conflicts.append(sc)
+    for r in df.itertuples():
+        contradictions, srcs, tgts = [], [], []
+        for sc in similar_map.get((r.Source_Patent_Extracted, r.Source_Claim_Num), []):
+            key = (r.Source_Patent_Extracted, sc,
+                   r.Target_Patent_Extracted, r.Target_Claim_Num)
+            if key in cat_map and cat_map[key] != cat_map[(r.Source_Patent_Extracted,
+                                                          r.Source_Claim_Num,
+                                                          r.Target_Patent_Extracted,
+                                                          r.Target_Claim_Num)]:
+                srcs.append(f"{r.Source_Patent_Extracted}_{sc}")
+                tgts.append(f"{r.Target_Patent_Extracted}_{r.Target_Claim_Num}")
+                contradictions.append(f"{srcs[-1]} with {tgts[-1]} → {cat_map[key]}")
 
-        if conflicts:
-            conflict_ids[i] = f"CG_{gid:04d}"
-            gid += 1
-            notes.append("Conflict")
-        else:
-            notes.append("")
+        conflict_notes.append(
+            f"⚠️ Conflict: Similar claim(s) have different category: {', '.join(contradictions)}"
+            if contradictions else ""
+        )
+        conflict_srcs.append("|".join(srcs))
+        conflict_tgts.append("|".join(tgts))
 
-    df["Conflict Note"] = notes
-    df["Conflict Group ID"] = conflict_ids
-    return df
+    df['Conflict Note'] = conflict_notes
+    df['Conflicting Source refs'] = conflict_srcs
+    df['Conflicting Target refs'] = conflict_tgts
+
+    return df, all_pairs_df, summary_df
 
 # =================================================
-# =================== STAGE 3 =====================
+# ============== STAGE 2 (VERBATIM) ===============
 # =================================================
 
-def run_stage_3(df):
-    df = df.copy()
+def parse_claims(refs):
+    claims = set()
+    if not (pd.notna(refs) and str(refs).strip()):
+        return claims
+    for part in str(refs).split('|'):
+        m = re.search(r'_(\d+)$', part.strip())
+        if m:
+            claims.add(int(m.group(1)))
+    return claims
 
-    for cg, g in df.groupby("Conflict Group ID"):
-        if not cg:
+def build_similarity_graph(sim_df):
+    graph = defaultdict(lambda: defaultdict(set))
+    for _, r in sim_df.iterrows():
+        m = re.search(r'Claim (\d+) is similar to Claim (\d+)', r['Summary'])
+        if m:
+            c1, c2 = int(m.group(1)), int(m.group(2))
+            graph[r['Source Patent']][c1].add(c2)
+            graph[r['Source Patent']][c2].add(c1)
+    return graph
+
+def connected_components(nodes, graph):
+    visited, comps = set(), []
+    for n in nodes:
+        if n in visited:
             continue
+        stack, comp = [n], set()
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            comp.add(cur)
+            for nb in graph.get(cur, []):
+                if nb in nodes:
+                    stack.append(nb)
+        comps.append(comp)
+    return comps
 
-        final_cat = str(g['Final category of winner'].iloc[0]).strip()
-        winners = g[g['Category'].astype(str).str.strip() == final_cat]
+def run_stage_2(df, summary_df):
 
-        if not winners.empty:
-            df.loc[g.index, "Updated Category"] = final_cat
-            df.loc[g.index, "No Winner Group"] = False
-        else:
-            df.loc[g.index, "No Winner Group"] = True
+    sim_graph = build_similarity_graph(summary_df)
+    group_ids = [""] * len(df)
+    group_counter = 1
+    target_map = defaultdict(list)
 
+    for idx, r in df.iterrows():
+        if r['Conflicting Source refs'] and r['Conflicting Target refs']:
+            for tgt in str(r['Conflicting Target refs']).split('|'):
+                target_map[tgt.strip()].append(idx)
+
+    for tgt, idxs in target_map.items():
+        involved = defaultdict(set)
+        for idx in idxs:
+            r = df.loc[idx]
+            involved[r['Source_Patent_Extracted']].add(int(r['Source_Claim_Num']))
+            involved[r['Source_Patent_Extracted']].update(
+                parse_claims(r['Conflicting Source refs'])
+            )
+
+        for pat, claims in involved.items():
+            comps = connected_components(claims, sim_graph.get(pat, {}))
+            for comp in comps:
+                gid = f"CG_{group_counter:04d}"
+                group_counter += 1
+                for idx in idxs:
+                    r = df.loc[idx]
+                    all_claims = {int(r['Source_Claim_Num'])} | parse_claims(r['Conflicting Source refs'])
+                    if all_claims & comp:
+                        group_ids[idx] = gid
+
+    df['Conflict Group ID'] = group_ids
     return df
 
 # =================================================
 # ================= STREAMLIT =====================
 # =================================================
 
-st.title("Patent Diff & Conflict Analysis Pipeline")
+st.title("Patent Diff & Conflict Pipeline (Parity Safe)")
+
+for k in ["base_df", "stage0_df", "stage21_df"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
 uploaded = st.file_uploader("Upload Excel file", type=["xlsx"])
 
 if uploaded:
-    base_df = pd.read_excel(uploaded)
 
-    st.success("Running Stage 0...")
-    stage0_df = run_stage_0(base_df)
+    if st.session_state.base_df is None:
+        st.session_state.base_df = pd.read_excel(uploaded)
+
+    if st.session_state.stage0_df is None:
+        st.session_state.stage0_df = run_stage_0(st.session_state.base_df)
+
+    stage0_df = st.session_state.stage0_df
 
     buf0 = BytesIO()
     stage0_df.to_excel(buf0, index=False)
     st.download_button("⬇ Download Stage 0 Output", buf0.getvalue(), "stage_0_output.xlsx")
 
-    st.success("Running Stage 2.1 (Merged Stage 1 + 2)...")
-    stage21_df = run_stage_2_1(stage0_df)
+    if st.session_state.stage21_df is None:
+        df1, all_pairs, summary = run_stage_1(stage0_df)
+        st.session_state.stage21_df = run_stage_2(df1, summary)
+
+    stage21_df = st.session_state.stage21_df
 
     buf21 = BytesIO()
     stage21_df.to_excel(buf21, index=False)
     st.download_button("⬇ Download Stage 2.1 Output", buf21.getvalue(), "stage_2_1_output.xlsx")
 
-    st.divider()
-
-    if st.button("▶ Run Stage 3"):
-        final_df = run_stage_3(stage21_df)
-        buf3 = BytesIO()
-        final_df.to_excel(buf3, index=False)
-        st.download_button("⬇ Download Stage 3 Output", buf3.getvalue(), "stage_3_output.xlsx")
+    if st.button("🔄 Reset Pipeline"):
+        for k in ["base_df", "stage0_df", "stage21_df"]:
+            st.session_state[k] = None
+        st.experimental_rerun()
