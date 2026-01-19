@@ -4,7 +4,7 @@ import difflib
 import re
 from collections import defaultdict
 from io import BytesIO
-from tqdm import tqdm
+import hashlib
 
 # =================================================
 # =================== STAGE 0 =====================
@@ -47,20 +47,18 @@ def get_diff_tokens(source, target):
 def run_stage_0(df):
     out = df.copy()
     src_extra, tgt_extra = [], []
-
     for _, r in df.iterrows():
         s = str(r.get("Source claim#", ""))
         t = str(r.get("Target claim#", ""))
         stoks, ttoks = get_diff_tokens(s, t)
         src_extra.append(sum(1 for _, x in stoks if x == "extra"))
         tgt_extra.append(sum(1 for _, x in ttoks if x == "extra"))
-
     out["Source extra count"] = src_extra
     out["Target extra count"] = tgt_extra
     return out
 
 # =================================================
-# ============== STAGE 1 (VERBATIM) ===============
+# ============== STAGE 1 (UNCHANGED) ==============
 # =================================================
 
 def split_ref(ref):
@@ -68,7 +66,6 @@ def split_ref(ref):
     return (m.group(1), int(m.group(2))) if m else (ref, -1)
 
 def run_stage_1(df):
-
     df = df.copy()
 
     df_unique = df[['Source ref', 'Actions and Conditions in First Patent']].drop_duplicates()
@@ -77,8 +74,7 @@ def run_stage_1(df):
     )
     df_unique['Action_text'] = df_unique['Actions and Conditions in First Patent'].fillna("")
 
-    results = []
-    summary_rows = []
+    results, summary_rows = [], []
 
     for patent, group in df_unique.groupby('Source_Patent'):
         rows = list(group.itertuples(index=False))
@@ -158,7 +154,7 @@ def run_stage_1(df):
     return df, all_pairs_df, summary_df
 
 # =================================================
-# ============== STAGE 2 (VERBATIM) ===============
+# ============== STAGE 2 (UNCHANGED) ==============
 # =================================================
 
 def parse_claims(refs):
@@ -200,7 +196,6 @@ def connected_components(nodes, graph):
     return comps
 
 def run_stage_2(df, summary_df):
-
     sim_graph = build_similarity_graph(summary_df)
     group_ids = [""] * len(df)
     group_counter = 1
@@ -238,39 +233,64 @@ def run_stage_2(df, summary_df):
 # ================= STREAMLIT =====================
 # =================================================
 
-st.title("Patent Diff & Conflict Pipeline (Parity Safe)")
+st.title("Patent Conflict Pipeline (Excel-Parity Safe)")
 
-for k in ["base_df", "stage0_df", "stage21_df"]:
-    if k not in st.session_state:
-        st.session_state[k] = None
+if "file_hash" not in st.session_state:
+    st.session_state.file_hash = None
 
 uploaded = st.file_uploader("Upload Excel file", type=["xlsx"])
 
 if uploaded:
+    file_bytes = uploaded.getvalue()
+    file_hash = hashlib.md5(file_bytes).hexdigest()
 
-    if st.session_state.base_df is None:
-        st.session_state.base_df = pd.read_excel(uploaded)
+    if st.session_state.file_hash != file_hash:
+        st.session_state.file_hash = file_hash
 
-    if st.session_state.stage0_df is None:
-        st.session_state.stage0_df = run_stage_0(st.session_state.base_df)
+        base_df = pd.read_excel(BytesIO(file_bytes))
+        stage0_df = run_stage_0(base_df)
 
-    stage0_df = st.session_state.stage0_df
+        # ---- Stage 1 ----
+        stage1_df, all_pairs_df, summary_df = run_stage_1(stage0_df)
 
-    buf0 = BytesIO()
-    stage0_df.to_excel(buf0, index=False)
-    st.download_button("⬇ Download Stage 0 Output", buf0.getvalue(), "stage_0_output.xlsx")
+        # Write Stage 1 to Excel buffer (NORMALIZATION STEP)
+        stage1_buf = BytesIO()
+        with pd.ExcelWriter(stage1_buf, engine="xlsxwriter") as w:
+            stage1_df.to_excel(w, sheet_name="Categorization+Conflicts", index=False)
+            all_pairs_df.to_excel(w, sheet_name="All Pairs", index=False)
+            summary_df.to_excel(w, sheet_name="Similar Pairs", index=False)
 
-    if st.session_state.stage21_df is None:
-        df1, all_pairs, summary = run_stage_1(stage0_df)
-        st.session_state.stage21_df = run_stage_2(df1, summary)
+        stage1_buf.seek(0)
 
-    stage21_df = st.session_state.stage21_df
+        # Read back normalized Stage 1
+        norm_stage1_df = pd.read_excel(stage1_buf, sheet_name="Categorization+Conflicts")
+        norm_summary_df = pd.read_excel(stage1_buf, sheet_name="Similar Pairs")
+
+        stage21_df = run_stage_2(norm_stage1_df, norm_summary_df)
+
+        st.session_state.stage0_df = stage0_df
+        st.session_state.stage1_buf = stage1_buf
+        st.session_state.stage21_df = stage21_df
+
+    # ---------------- Downloads ----------------
+
+    st.download_button(
+        "⬇ Download Stage 0 Output",
+        st.session_state.stage0_df.to_excel(index=False),
+        "stage_0_output.xlsx"
+    )
+
+    st.download_button(
+        "⬇ Download Stage 1 Output",
+        st.session_state.stage1_buf.getvalue(),
+        "stage_1_output.xlsx"
+    )
 
     buf21 = BytesIO()
-    stage21_df.to_excel(buf21, index=False)
-    st.download_button("⬇ Download Stage 2.1 Output", buf21.getvalue(), "stage_2_1_output.xlsx")
+    st.session_state.stage21_df.to_excel(buf21, index=False)
 
-    if st.button("🔄 Reset Pipeline"):
-        for k in ["base_df", "stage0_df", "stage21_df"]:
-            st.session_state[k] = None
-        st.experimental_rerun()
+    st.download_button(
+        "⬇ Download Stage 2.1 Output",
+        buf21.getvalue(),
+        "stage_2_1_output.xlsx"
+    )
